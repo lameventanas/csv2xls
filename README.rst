@@ -47,4 +47,4 @@ With `t/test1.csv <https://raw.github.com/lameventanas/csv2xls/master/t/test1.cs
 
 .. image:: https://raw.github.com/lameventanas/csv2xls/master/t/test1.png
 
-See the `full documentation <https://github.com/lameventanas/csv2xls/csv2xls.rst>`_.
+See the `full documentation <https://github.com/lameventanas/csv2xls/blob/main/csv2xls.rst>`_.
