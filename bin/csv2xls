@@ -1,0 +1,601 @@
+#!perl
+use strict;
+use warnings;
+use Pod::Usage qw(pod2usage);
+use Pod::Man;
+use Excel::Writer::XLSX;
+use Excel::Writer::XLSX::Utility;
+use Text::CSV;
+use Text::ParseWords qw(parse_line);
+use Data::Dumper;
+$Data::Dumper::Sortkeys = 1;
+our $VERSION = 1.0;
+
+=head1 NAME
+
+csv2xls - Convert CSV files to Excel
+
+=head1 SYNOPSIS
+
+csv2xls [global_options] {[input_options] --csv=input_csv} ... {[xls_options] [--xls=output_xls]}
+
+=head1 GLOBAL OPTIONS
+
+=over 4
+
+=item B<--verbose>
+
+=item B<--verbose>=x
+
+Change verbosity level (up to 2)
+
+=back
+
+=head1 FILES
+
+Input and output files can appear by themselves in the command line.  Files with extensions matching Excel standard ones will be taken as output files, otherwise as input files.  If no output files are specified, an output filename will be made based on the first input file.
+
+=head1 INPUT OPTIONS
+
+=over 4
+
+=item B<< --separator=<char> >>
+
+Column separator. If not specified, will be guessed.
+
+=item B<< --encoding=<encoding> >>
+
+Set file encoding. If not specified will use utf-8.
+
+=item B<< --name=<name> >>
+
+Set default name on destination sheets of output.  If not specified, will be derived from filename.
+
+=back
+
+=head1 OUTPUT OPTIONS
+
+=head1 PROPERTIES
+
+=over 4
+
+=item B<< --title=<text> >>
+
+=item B<< --subject=<text> >>
+
+=item B<< --author=<text> >>
+
+=item B<< --manager=<text> >>
+
+=item B<< --company=<text> >>
+
+=item B<< --category=<text> >>
+
+=item B<< --keywords=<text> >>
+
+=item B<< --comments=<text> >>
+
+=item B<< --status=<text> >>
+
+=item B<< --hyperlink_base=<text> >>
+
+=back
+
+=head1 OUTPUT SHEET OPTIONS
+
+Formatting options must specify a sheet number, and may specify a range.
+If no range is provided, they will be applied to the whole sheet.
+
+=over 4
+
+=item B<< --sheet<nr>=FORMATS >>
+
+=item B<< --sheet<nr>[-<range>]=FORMATS >>
+
+=item B<< --sheet<nr>-split-panes[=<Y,X[,top_row,left_col]>] >>
+
+=item B<< --sheet<nr>-freeze-panes[=<row,col[,top_row,left_col]>] >>
+
+=item B<< --sheet<nr>-grid-lines={all|screen|none} >>
+
+Where <nr> is a sheet number, starting with 1.
+
+=back
+
+=head1 FORMATS
+
+Formats are space-separated. Quotes may be used to protect spaces in format parameters.
+
+=over 4
+
+=item B<< align={center|left|right|fill|justify|center_across|top|vcentter|bottom|vjustify} >>
+
+It can be specified more than once, for horizontal / vertical alignment.
+
+=item B<< autofilter >>
+
+=item B<< autofit >>
+
+=item B<< bold >>
+
+=item B<< border=NUM >>
+
+NUM is a number from 0 to 13, see the L<Excel border styles|https://metacpan.org/pod/Excel::Writer::XLSX#set_border()>
+
+=item B<< color=COLOR >>
+
+=item B<< bg_color=COLOR >>
+
+=item B<< font=FONTNAME >>
+
+FONTNAME may be quoted to protect spaces
+
+=item B<< font_strikeout >>
+
+=item B<< italic >>
+
+=item B<< num_format=NUMFORMAT >>
+
+=item B<< rotation=DEGREES >>
+
+DEGREES is any angle in the range -90 to 90.
+
+=item B<< underline >>
+
+=back
+
+=head1 POSITIONS
+
+=over 4
+
+=item B<< <col><row> >>
+
+Example: B<C7>
+
+=item B<< <row>,<col> >>
+
+Example: B<7,3>
+
+=back
+
+=head1 RANGES
+
+=over 4
+
+=item B<< <start>:<end> >>
+
+Example: B<< A1:C7 >>
+
+=item B<< <row1>,<col1>:<row2>,<col2> >>
+
+Example: B<< 1,1:7,3 >>
+
+=item B<< /RE/:/RE/ >>
+
+Example: B<< /Header/:/Totals?/ >>
+
+Positions of different kinds can be combined to form a range.
+
+Example: B<< A1:/(?i)fin/ >>
+
+This range will be from the first cell, until a cell containing "fin" (case-insensitive match)
+
+=back
+
+=head1 SEE ALSO
+
+L<csv2xls code repository|https://github.com/lameventanas/csv2xls>
+
+L<Excel::Writer::XLSX code repository|https://github.com/jmcnamara/excel-writer-xlsx>
+
+=head1 AUTHOR
+
+Alan Mizrahi, lameventanas at gmail dot com
+
+=cut
+
+my $verbose = 0;
+my @autofit_factor = (1.0, 0.0); # multiply factor, add factor
+my $out;    # { fname => <filename>, props => {} }
+my @sheets; #  contains data for each sheet that will be produced:
+            # {
+            #   input => {fname => <string>, separator => <char>, encoding => <string>, name => <string> },
+            #   specs => {name => <string>, formats|misc => [ { ops => [<string>, ...], arg => <string>, range => <range> }, ... ] }
+
+# returns array ref: [ <start>, <end> ]
+# where <start> and <end> may be:
+# - undef: first/last position available in data
+# - string: RE to match (in case of <start>, pos is the first to match, in case of <end>, pos is the last to match)
+# - array: [row, col]
+
+# components: empty, A1, tuple, re
+sub parse_range {
+    my ($s) = @_;
+
+    if ($s =~ /^(.*)(?<!\\):(.*)$/) {
+        my $p1 = parse_range_part($1);
+        my $p2 = parse_range_part($2);
+
+        return undef if
+            (defined($p1) && isnum($p1) && $p1 < 0) ||
+            (defined($p2) && isnum($p2) && $p2 < 0);
+
+        # check if one part is relative but the other can't be resolved (ie: all or also relative)
+        return undef if
+            (ref($p1) eq 'HASH' && (!defined($p2) || ref($p2) eq 'HASH')) ||
+            (ref($p2) eq 'HASH' && (!defined($p1) || ref($p1) eq 'HASH'));
+        return [ $p1, $p2 ];
+    }
+    return undef;
+}
+
+# returns range <start> or <end>:
+# auto  -> undef
+# A1    -> arrayref
+# tuple -> arrayref
+# re    -> string
+# error -> -1
+
+sub parse_range_part {
+    my ($s) = @_;
+
+    return undef if $s eq ''; # empty
+    return [ splice(@{[xl_cell_to_rowcol(uc $s)]}, 0, 2) ] if $s =~ /^[a-zA-Z]\d+$/; # A1
+    return [ $2 - 1, $1 - 1 ] if $s =~ /^(\d+),(\d+)$/; # tuple
+    return $1 if $s =~ /^\/(.+)\/$/; # RE
+
+    # error
+    return -1;
+}
+
+# takes range reference: [r1, c1], [r2, c2]
+# returns range in A1:B2 notation, for debugging
+sub xl_rowcol_to_range {
+    my ($range) = @_;
+    my $ret = sprintf('%s:%s', xl_rowcol_to_cell($range->[0][0], $range->[0][1]), xl_rowcol_to_cell($range->[1][0], $range->[1][1]));
+    return $ret;
+}
+
+# return range as string, for debugging
+sub fmt_range {
+    my ($range) = @_;
+    my $s = Dumper($range);
+    $s =~ s{\n}{}g;
+    $s =~ s{\s+}{ }g;
+    $s =~ /.*=\s*(.+);/;
+    return $1;
+}
+
+# returns type of range part
+sub range_part_type {
+    my ($part) = @_;
+    return 'all' unless defined $part;
+    return 'position' if ref($part) eq 'ARRAY';
+    return 're';
+}
+
+# given a range and data, resolves the range to absolute positions
+# EG: resolves any REs, undefs, etc.
+sub get_range {
+    my ($range, $data) = @_;
+    my ($p1, $p2) = @{$range};
+    my ($t1, $t2) = (range_part_type($p1), range_part_type($p2));
+    my $ret = [ undef, undef ];
+
+    if ($t1 eq 'position') {
+        $ret->[0] = $p1;
+    } elsif ($t1 eq 'all') {
+        $ret->[0] = [0, 0];
+    }
+    if ($t2 eq 'position') {
+        $ret->[1] = $p2;
+    } elsif ($t1 eq 'all') {
+        $ret->[1] = [ $#{$data}, $#{$data->[0]} ];
+    }
+
+    return $ret unless $t1 eq 're' || $t2 eq 're';
+
+    RE_SEARCH:
+    for my $i (0 .. $#{$data}) {
+        for my $j (0 .. $#{$data->[$i]}) {
+            next unless defined $data->[$i][$j];
+            if ($t1 eq 're' && $data->[$i][$j] =~ $p1) {
+                $ret->[0] = [ $i, $j ] unless defined $ret->[0]; # take first available
+                last RE_SEARCH unless $t2 eq 're';
+            }
+            if ($t2 eq 're' && $data->[$i][$j] =~ $p2) {
+                if ((defined $ret->[0]) &&
+                ($ret->[0][0] <= $i && $ret->[0][1] <= $j) &&
+                ($i+$j) >= $ret->[0][0]+$ret->[0][1]) {
+                    $ret->[1] = [ $i, $j ]; # take last available
+                }
+            }
+        }
+    }
+
+    return $ret;
+}
+
+# return true if row and col is within range
+sub in_range {
+    my ($row, $col, $range) = @_;
+    return undef unless defined $range->[0] && defined $range->[1];
+    return $row >= $range->[0][0] && $col >= $range->[0][1] && $row <= $range->[1][0] && $col <= $range->[1][1]
+}
+
+# return true if argument is a number
+# distinguishes between number-looking strings and numbers
+sub isnum ($) {
+    return 0 if $_[0] eq '';
+    $_[0] ^ $_[0] ? 0 : 1
+}
+
+# read csv file, return raw data (array of arrays of value)
+sub get_csv_data {
+    my ($csv) = @_;
+    my ($csvfh, $csvob);
+    my @ret;
+
+    printf("\tReading csv: %s\n", $csv->{fname}) if $verbose;
+    $csvob = Text::CSV->new( { auto_diag => 1, binary => 1, eol => "\n", sep_char => $csv->{separator} || "\t", allow_loose_quotes => 1, empty_is_undef => 1, blank_is_undef => 1, allow_whitespace => 1 } ) or die "Error creating Text::CSV object: ".Text::CSV->error_diag;
+        open $csvfh, "<:encoding($csv->{encoding})", $csv->{fname} or die "Error opening $csv->{fname}: $!";
+
+    my $i = 0;
+    while (my $row = $csvob->getline($csvfh)) {
+        foreach my $j (0 .. $#$row) {
+            $ret[$i][$j] = $row->[$j];
+        }
+        $i++;
+    }
+    close $csvfh;
+    printf("\tRead csv: %s rows: %d cols: %d\n", $csv->{fname}, scalar(@ret), scalar(@{$ret[0]})) if $verbose >= 2;
+
+    return \@ret;
+}
+
+# detect csv separator of given filename
+sub detect_csv_separator {
+    my ($fname) = @_;
+    eval { require Text::CSV::Separator; 1; } or die "No separator provided for $fname, and Text::CSV::Separator is not installed";
+    my @seps = Text::CSV::Separator::get_separator(path => $fname, echo => ($verbose >=2) );
+    die "Could not find separator for $fname" if $#seps == -1;
+    die "Could not find unique separator for $fname, got: " . join(' ', @seps) if $#seps > 0;
+    return $seps[0];
+}
+
+# show error message and exit
+sub usage_exit {
+    my ($msg) = @_;
+    print STDERR "\n", $msg, "\n\n" if defined $msg;
+    pod2usage( -verbose => 2, -noperldoc => 1, -exit => 'NOEXIT' );
+    exit(defined $msg ? 1 : 0);
+}
+
+# parse program arguments
+sub parse_args {
+    my ($args) = @_;
+    my $si = 0; # current sheet index (used only for csv args)
+    my %csvopt; # the position of csv options determine to which csv they are apply, they must appear before each corresponding --csv arg. ie: --encoding shift-jis --csv japanese.csv --encoding utf-8 --csv unicode.csv
+
+    foreach my $arg (@{$args}) {
+        # global options
+        if ( $arg eq '--help' || $arg eq '-h' ) {
+            usage_exit();
+        }
+        elsif ( $arg =~ /^--verbose(?:=(\d+))?$/ ) {
+            if (defined $1) {
+                $verbose = $1;
+            } else {
+                $verbose++;
+            }
+        }
+        elsif ( $arg =~ /^--autofit-factor=(?<mul>\d+(?:\.\d+)?)(?:,(?<add>-?\d+(?:\.\d+)?))?$/ ) {
+            my ($mul,$add) = ($+{mul}, $+{add} // 0.0);
+            @autofit_factor=($mul + 0.0, $add + 0.0);
+        }
+        # input options
+        elsif ( $arg =~ /^--(separator|encoding)=(.)$/ ) {
+            $csvopt{$1} = $2;
+        }
+        elsif ( $arg =~ /^--csv=(.+)$/ || ($arg !~ /^--/ && $arg !~ /(.+\.xl\w\w?)$/i && $arg =~ /(.+)/) ) {
+            $csvopt{fname} = $1;
+            $sheets[$si++]{input} = { %csvopt }; # add previously found csv options for this csv
+            %csvopt = (); # clear for next csv
+        }
+        # output options
+        elsif ( $arg =~ /^--(title|subject|author|manager|company|category|keywords|comments|status|hyperlink_base)=(.+)$/ ) {
+            $out->{props}{$1} = $2;
+        }
+        elsif ( $arg =~ /^--sheet(?<sheet>\d+)-name=(?<name>.+)/ ) {
+            $sheets[$+{sheet}-1]{specs}{name} = $+{name};
+        }
+        elsif ( $arg =~ /^--sheet(?<sheet>\d+)-(?<format>freeze-panes|split-panes)=(?<rowcols>[,\.0-9]+)$/ ) {
+            push(@{$sheets[$+{sheet}-1]{specs}{misc}}, { ops => [ $+{format} ], arg => $+{rowcols} } );
+        }
+        elsif ( $arg =~ /^--sheet(?<sheet>\d+)-(?<format>grid-lines)=(?<arg>all|screen|none)$/ ) {
+            my %grid_lines_arg = (all => 0, screen => 1, none => 2);
+            push(@{$sheets[$+{sheet}-1]{specs}{misc}}, { ops => [ $+{format} ], arg => $grid_lines_arg{$+{arg}}});
+        }        # these all receive a range as argument
+        elsif ( $arg =~ /^--sheet(?<sheet>\d+)(?:-(?<range>.+?))?=(?<formats>.+)$/) {
+            my $range = [undef, undef]; # if no range is specified, applies to everything
+            if (defined $+{range}) {
+                $range = parse_range($+{range}) or usage_exit("Error in $arg\nInvalid range: $+{range}");
+            }
+            # validate format specification list
+            my $si = $+{sheet} - 1;
+            my @formats = parse_line('\s+', 0, $+{formats});
+            my (@real, @misc); # real=>real format specifications, misc=> autofit|autofilter|freeze_panes
+            foreach my $fmt (@formats) {
+                if ($fmt !~ /^(?:autofit|autofilter|bold|border=\d+|font=.+|font_strikeout|italic|num_format=.+|rotation=\d+|size=\d+|shrink|underline|align=(?:left|center|right|fill|justify|center_across|top|vcenter|bottom|vjustify)|(?:bg_)?color=(?:#[\da-fA-F]{6}|black|blue|brown|cyan|gray|green|lime|magenta|navy|orange|pink|purple|red|silver|white|yellow))$/) {
+                    usage_exit("Error in $arg:\nInvalid format specification: $fmt");
+                }
+                if ($fmt =~ /^(?:autofit|autofilter)$/) { # these are not really formats
+                    push(@misc, $fmt);
+                } else {
+                    push(@real, $fmt);
+                }
+            }
+            push(@{$sheets[$si]{specs}{formats}}, { ops => \@real, range => $range } ) if $#real > -1;
+            push(@{$sheets[$si]{specs}{misc}}, { ops => \@misc, range => $range } ) if $#misc > -1;
+        }
+
+        elsif ( $arg =~ /^--xls=(.+)$/ || ($arg !~ /^--/ && $arg =~ /(.+\.xl\w\w?)$/i) ) {
+            usage_exit("Error in $arg\nOnly one output file is supported") if defined $out->{fname};
+            $out->{fname} = $1;
+        }
+        else {
+            usage_exit("Invalid argument: $arg");
+        }
+    }
+}
+
+# create sheet based on $specs and $data, add to $book
+sub add_sheet {
+    my ($book, $specs, $data) = @_;
+    my %colsize;     # for autofit of this sheet col => size
+    my %formats;     # all format combinations. key is a comma-separated string of format indices for this sheet (sorted)
+
+    my $ws = $book->add_worksheet(substr($specs->{name}, 0, 31));
+
+    # resolve ranges for formats and misc
+    foreach my $o (@{$specs->{formats}}, @{$specs->{misc}}) {
+        $o->{range} = get_range($o->{range} // [undef, undef], $data);
+    }
+
+    # get all ranges for autofit operations in advance (misc operation that depends on cell data)
+    my @autofit_ranges;
+    foreach my $misc (@{$specs->{misc}}) {
+        if (grep { $_ eq 'autofit' } @{$misc->{ops}}) {
+            push(@autofit_ranges, $misc->{range});
+        }
+    }
+
+    for my $di (0 .. $#{$data}) {
+        for my $dj (0 .. $#{$data->[$di]}) {
+
+            # find/create format to use for this cell
+            my @use_formats = grep { in_range($di, $dj, $specs->{formats}[$_]{range}) } (0 .. $#{$specs->{formats}});
+            my $format_key = join(',', @use_formats);
+            if (@use_formats && !defined $formats{$format_key}) {
+                print "Creating new format combination for $format_key\n" if $verbose >= 2;
+                $formats{$format_key} = $book->add_format();
+                foreach my $fi (@use_formats) {
+                    foreach my $op (@{$specs->{formats}[$fi]{ops}}) {
+                        if ($op =~ /(.+?)=(.+)/) {
+                            $formats{$format_key}->set_format_properties($1 => $2);
+                        } else {
+                            $formats{$format_key}->set_format_properties($op => 1);
+                        }
+                    }
+                }
+            }
+
+            # write data with specified format combination
+            $ws->write($di, $dj, $data->[$di][$dj] // '', @use_formats ? $formats{$format_key} : undef);
+
+            # if cells falls within autofit range, take cell into account for %colsize
+            for my $autofit_range (@autofit_ranges) {
+                if (in_range($di, $dj, $autofit_range)) {
+                    my $len = length($data->[$di][$dj]);
+                    if (defined($len) && (!defined($colsize{$dj}) || $len > $colsize{$dj})) {
+                        $colsize{$dj} = $len if !defined($colsize{$dj}) || $len > $colsize{$dj};
+                        last;
+                    }
+                }
+            }
+        }
+    }
+
+    # Apply autofilter, freeze-panes and split-panes (misc formatting operations that dont depend on cell data)
+    foreach my $misc (@{$specs->{misc}}) {
+        foreach my $op (@{$misc->{ops}}) {
+            printf("Applying %s on range %s\n", $op, fmt_range($misc->{range})) if $verbose >= 2;
+            if ($op eq 'autofilter') {
+                $ws->autofilter($misc->{range}->[0][0], $misc->{range}->[0][1], $misc->{range}->[1][0], $misc->{range}->[1][1]);
+            }
+            if ($op eq 'freeze-panes') {
+                $ws->freeze_panes(split(/,/, $misc->{arg}));
+            }
+            if ($op eq 'split-panes') {
+                $ws->split_panes(split(/,/, $misc->{arg}));
+            }
+            if ($op eq 'grid-lines') {
+                $ws->hide_gridlines($misc->{arg});
+            }
+        }
+    }
+
+    # Apply autofit with previously calculated column sizees
+    foreach my $c (keys %colsize) {
+        $ws->set_column($c, $c, $colsize{$c} * $autofit_factor[0] + $autofit_factor[1]);
+    }
+}
+
+# entry point
+sub main {
+    parse_args(\@ARGV);
+
+    for my $si (0 .. $#sheets) {
+        usage_exit("No input csv specified for sheet ".($si+1)) unless defined $sheets[$si]{input}{fname};
+    }
+
+    # if no output was specified, make one based on first input csv
+    if (!defined $out->{fname}) {
+        $sheets[0]{input}{fname} =~ /(.+)\.[^\.]{1,5}$/;
+        $out->{fname} = ( $1 || $sheets[0]{input}{fname} ) . '.xlsx';
+        #usage_exit("No output filename provided and " . $out->{fname} . " already exists") if -f $out->{fname};
+    }
+
+    # fill undefined input attributes
+    for my $si (0 .. $#sheets) {
+        my $input = $sheets[$si]{input};
+
+        $input->{encoding} = 'utf-8' unless defined $input->{encoding};
+        if (! defined $input->{separator}) {
+            $input->{separator} = detect_csv_separator($input->{fname});
+            printf("%s: detected separator \"%s\"\n", $input->{fname}, $input->{separator} eq "\t" ? '\t' : $input->{separator}) if $verbose;
+        }
+    }
+
+    # show summary of defined inputs and output
+    print "Sheets:\n" . Dumper(\@sheets) if $verbose >= 2;
+
+    # create Excel book
+    printf("Writing output to %s\n", $out->{fname}) if $verbose;
+    my $book = Excel::Writer::XLSX->new($out->{fname}) or die "Error creating $out->{fname}: $!";
+    $book->set_optimization();
+    $book->set_properties(%{$out->{props}}) if defined $out->{props};
+
+    # add sheets
+    foreach my $si (0 .. $#sheets) {
+        my $input = $sheets[$si]{input};
+        my $specs = $sheets[$si]{specs};
+        my $data;
+
+        # get name from corresponding csv if missing
+        if (!defined $specs->{name}) {
+            $input->{fname} =~ /[\\\/]?([^\\\/]+?)(?:\..{1,5})?$/;
+            $specs->{name} = ucfirst($1);
+        }
+        printf("Creating sheet %d: %s\n", $si+1, $specs->{name}) if $verbose;
+        print Dumper($specs) if $verbose >= 2;
+
+        $data = get_csv_data($input);
+        if ($verbose >= 2) {
+            printf("Sheet %d data:\n", $si+1);
+            print Dumper($data);
+        }
+
+        add_sheet($book, $specs, $data);
+    }
+
+    $book->close();
+}
+
+BEGIN {
+    $|=1;
+    binmode(STDOUT, ':encoding(UTF-8)');
+    binmode(STDERR, ':encoding(UTF-8)');
+}
+
+main();
